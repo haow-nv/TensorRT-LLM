@@ -8040,6 +8040,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_heads: int,
             seq_len_q: int,
             page_size: int,
+            max_batch_size: int = 0,
         ):
             super().__init__()
             kernel_class = self.__class__._KERNEL_CLASS_BY_DTYPE.get(in_dtype)
@@ -8053,12 +8054,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.num_heads = num_heads
             self.seq_len_q = seq_len_q
             self.page_size = page_size
+            self.max_batch_size = max_batch_size
 
         def unique_id(self):
+            # seq_len_q is intentionally NOT part of the id: it is a tuned
+            # tensor dimension (see get_tuning_config), so entries profiled
+            # while tuning at one seq_len_q (e.g. the MTP target step's
+            # sq = 1 + draft_len) also serve lookups at every smaller
+            # power-of-2 seq_len_q (draft steps, spec-off decode).
             return (
                 self.in_dtype,
                 self.num_heads,
-                self.seq_len_q,
                 self.page_size,
             )
 
@@ -8264,13 +8270,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return inputs
 
         def get_tuning_config(self) -> TuningConfig:
-            """Batch is the one free tuning dim: bucket it (power-of-2) on
-            cache_seqs and tie every other batch-carrying dim to it via
-            constraints, so any runtime batch maps to a profiled bucket.
+            """Batch and seq_len_q are the two free tuning dims (profiled as
+            a cartesian product): batch on cache_seqs with power-of-2 buckets
+            (any runtime batch maps to a bucket), seq_len_q on q_latent with
+            exactly the buckets (1, seq_len_q) and EXACT-match lookup. Every
+            other dim carrying batch/seq_len_q is tied via constraints.
             Static-size dims (page_table's max_blocks) are excluded from the
             cache key (constraint -> -1) so a differing max_seq_len does not
-            miss."""
-            key = self.unique_id()
+            miss.
+
+            ``max_batch_size`` (when known, i.e. > 0) seeds
+            ``tune_max_num_tokens`` so one in-autotune forward at ANY batch
+            profiles the full power-of-2 bucket ladder up to the engine's max
+            batch; otherwise buckets stop at the batch observed during tuning
+            and every larger runtime batch silently falls to
+            ``default_tactic``, whose freshly computed split_kv can trigger a
+            multi-second kernel JIT inside the timed region.
+
+            The seq_len_q axis has exactly TWO buckets, (1, seq_len_q): the
+            only decode query lengths a run produces are the target step's
+            sq = 1 + draft_len and the draft/spec-off steps' sq = 1. The
+            tuple is STATIC rather than a generator because
+            ``tune_max_num_tokens`` seeds every callable bucket generator,
+            and batch's seed (max_batch_size) must not leak into the
+            seq_len_q axis. Tuning at the MTP target step's sq therefore
+            also profiles (and JIT-compiles) the sq=1 draft-step variants
+            inside the warmup window."""
+            key = self.unique_id() + (self.seq_len_q, self.max_batch_size)
             cache = self.__class__.tuning_config_cache
             if key not in cache:
                 # Inputs: 0 q_latent  1 q_rope  2 c_latent  3 c_rope
@@ -8279,28 +8305,61 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # cache_seqs (B,) -> 0, page_table (max_blocks, B) -> 1.
                 batch_dims = ((0, 3), (1, 3), (4, 1), (5, 0), (6, 3), (7, 2))
                 free = 5  # cache_seqs -- the free dynamic batch dim
-                # (input, dim) whose size is a static config quantity
-                # (page_table dim 0 = max_blocks), not per-request -- kept at
-                # its real size for profiling but excluded from the cache key.
-                static_size_dims = ((4, 0), )
+                # seq_len_q dim per input: q_latent/q_rope/o (H, D, S, B) -> 2,
+                # lse (H, S, B) -> 1. q_latent carries the free dim.
+                sq_dims = ((0, 2), (1, 2), (6, 2), (7, 1))
+                sq_free = 0
+                # (input, dim) whose size is a static config quantity, not
+                # per-request -- kept at its real size for profiling but
+                # excluded from the cache key: page_table dim0 (max_blocks),
+                # c_latent/c_rope dim2 (KV pool num_pages, differs between
+                # the estimation-phase and final KV cache), workspace dim0
+                # (numel differs between the eager `workspace` and
+                # `cuda_graph_workspace` buffers -- trtllm.py
+                # effective_workspace). Leaving any of these in the key
+                # fragments the cache across eager/graph/pool variants; the
+                # un-tuned variant then falls to default_tactic, whose novel
+                # split_kv JIT-compiles a kernel MID-RUN (~6.5 s stall).
+                static_size_dims = ((2, 2), (3, 2), (4, 0), (8, 0))
                 constraint_dims = [(i, d) for (i, d) in batch_dims if i != free]
                 batch_constraints = tuple(
                     ConstraintSpec(
                         i, d, lambda shapes, _free=free: shapes[_free][0])
                     for (i, d) in constraint_dims)
+                sq_constraints = tuple(
+                    ConstraintSpec(
+                        i, d, lambda shapes, _f=sq_free: shapes[_f][2])
+                    for (i, d) in sq_dims if i != sq_free)
                 static_constraints = tuple(
                     ConstraintSpec(
                         i, d, lambda shapes, _i=i, _d=d: shapes[_i][_d])
                     for (i, d) in static_size_dims)
                 cache[key] = TuningConfig(
-                    dynamic_tensor_specs=(DynamicTensorSpec(
-                        free,
-                        0,
-                        get_last_power_of_2_num_tokens_buckets,
-                        last_positive_power_of_2,
-                    ), ),
-                    constraint_specs=batch_constraints + static_constraints,
+                    dynamic_tensor_specs=(
+                        DynamicTensorSpec(
+                            free,
+                            0,
+                            get_last_power_of_2_num_tokens_buckets,
+                            last_positive_power_of_2,
+                        ),
+                        DynamicTensorSpec(
+                            sq_free,
+                            2,
+                            (1, self.seq_len_q)
+                            if self.seq_len_q > 1 else (1, ),
+                            # EXACT match only (identity map): a tactic tuned
+                            # at one seq_len_q is not validated for another,
+                            # so an unprofiled seq_len_q must miss the cache
+                            # and fall back to default_tactic, which computes
+                            # a legal split for the real shape.
+                            lambda x: x,
+                        ),
+                    ),
+                    constraint_specs=batch_constraints + sq_constraints +
+                    static_constraints,
                     inputs_pre_hook=self._tuning_inputs_pre_hook,
+                    tune_max_num_tokens=self.max_batch_size
+                    if self.max_batch_size > 0 else None,
                 )
             return cache[key]
 
@@ -8351,7 +8410,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 out_dtype = self.in_dtype
 
+            # The actual query length comes from the tensor, NOT
+            # self.seq_len_q: during AutoTuner profiling the tensors carry
+            # the bucketed seq_len_q, and the kernel is specialized per sq.
+            seq_len_q = int(q_latent.shape[2])
+
             cache_key = self.unique_id() + (
+                seq_len_q,
                 out_dtype,
                 mma_qk_tiler_mn,
                 mma_pv_tiler_mn,
@@ -8359,6 +8424,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 is_persistent,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
+                # A compile outside the tuning window stalls the serving loop
+                # for seconds -- always log enough to identify the variant.
+                logger.info(
+                    f"CuteDSL MLA decode: compiling kernel variant {cache_key} "
+                    f"B={cache_seqs.shape[0]} "
+                    f"tuning={AutoTuner.get().is_tuning_mode} "
+                    f"capturing={torch.cuda.is_current_stream_capturing()}")
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     self._CLUSTER_SHAPE_MNK[0] * self._CLUSTER_SHAPE_MNK[1] *
@@ -8371,7 +8443,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # folding code path. For seq_len_q == 1 it is always False, so
                 # plain decode is unchanged.
                 fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
-                           and self.seq_len_q > 1)
+                           and seq_len_q > 1)
 
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
@@ -8385,7 +8457,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._IS_VAR_SEQ,
                     self._IS_VAR_SPLIT_KV,
                     num_heads=self.num_heads,
-                    seq_len_q=self.seq_len_q,
+                    seq_len_q=seq_len_q,
                     fold_sq=fold_sq,
                 )
 
@@ -8479,11 +8551,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
 
         ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
         see ``BlackwellMultiHeadLatentAttentionForwardFP8``.
+        ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
+        the engine's max batch instead of stopping at the tuning-time batch.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -8497,6 +8572,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_heads=num_heads,
             seq_len_q=seq_len_q,
             page_size=page_size,
+            max_batch_size=max_batch_size,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
@@ -8537,6 +8613,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         return None
 
@@ -8560,11 +8637,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
 
         ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
         see ``BlackwellMultiHeadLatentAttentionForwardFP16``.
+        ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
+        the engine's max batch instead of stopping at the tuning-time batch.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -8595,6 +8675,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_heads=num_heads,
             seq_len_q=seq_len_q,
             page_size=page_size,
+            max_batch_size=max_batch_size,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
@@ -8635,5 +8716,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         return None

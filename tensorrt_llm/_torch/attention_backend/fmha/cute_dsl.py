@@ -207,32 +207,65 @@ class CuteDslMlaFmha(PhasedFmha):
             forward_args,
         )
         if not supported:
-            logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
+            # info_once keyed on the reason text (which embeds the offending
+            # shape), so each distinct reject cause is visible in default logs
+            # exactly once per process instead of flooding every dispatch.
+            logger.info_once(
+                f"CuTe DSL MLA FMHA does not support request: {reason}", key=reason
+            )
         return supported
 
-    @staticmethod
+    # Minimum decode batch (num_generations) per seq_len_q at which CuteDSL
+    # beats the default backend for H=16 (TP, attention-DP off). Derived from
+    # the DSV3 layer-wise sq-sweep matrix (8xB200 TP=8, fp8 KV, CUDA graph;
+    # layerwise_sqsweep_all_20260705_201444/matrix.md), MLA-module speedup M:
+    #   sq=2: wins from batch>=64 (M 1.05-1.28x); batch<=16 loses/par.
+    #   sq=4: wins from batch>=32 (M 1.04-1.86x); batch<=16 loses (M to 0.92x).
+    #   sq=8: wins from batch>=16 (M 1.07-2.91x); batch<=8 loses (M to 0.91x).
+    #   sq=1: no usable win region (only b64 at M 1.05x, loses at b128/256).
+    # The win grows monotonically with batch and KV inside each region, so a
+    # per-sq batch floor captures the structure without a KV term (KV length
+    # is per-request device data and not capture-safe to read at dispatch).
+    _H16_MIN_BATCH_BY_SQ = {2: 64, 4: 32, 8: 16}
+
+    @classmethod
     def _is_perf_favorable(
-        num_heads: int, seq_len_q: int, predicted_tokens_per_seq: int
+        cls,
+        num_heads: int,
+        seq_len_q: int,
+        predicted_tokens_per_seq: int,
+        num_generations: int,
     ) -> tuple[bool, str]:
         """Perf-only allowlist, separate from the correctness checks: admit
-        just the (num_heads, seq_len_q) shapes where CuteDSL decode is an
-        end-to-end win over the default backend.
+        just the shapes where CuteDSL decode is an end-to-end win over the
+        default backend.
 
-        Shapes where the CuTe DSL decode kernel BEATS the default TRTLLM path
-        end-to-end (DeepSeek-V3 8xB200 TP=8/EP=8 A/B, ISL1024/OSL2048):
-          H=16  (TP=8, attention-DP off): seq_len_q=2 +1.0%, seq_len_q=4 +2.2%
-          H=128 (attention-DP on)       : seq_len_q=1 +1.5%
-        Every other measured cell is at or below parity, so the gate admits
-        only the winning shapes and lets everything else fall back to the next
-        FMHA library.
+        H=16 (TP=8, attention-DP off): batch-aware floors per seq_len_q, see
+        ``_H16_MIN_BATCH_BY_SQ``. num_generations is a host scalar and each
+        CUDA graph is captured at a fixed (padded) batch, so the decision is
+        stable per graph.
 
-        The (128, 1) entry additionally requires spec-decode OFF
-        (``predicted_tokens_per_seq == 1``): with MTP enabled, seq_len_q == 1
+        H=128 (attention-DP on): the layer-wise matrix shows module parity
+        (0.97-1.05x) everywhere, but E2E A/B measured a steady-state loss for
+        seq_len_q > 1 (ADP+MTP3 about -11% with the gate off), so only
+        (128, 1) with spec-decode OFF (``predicted_tokens_per_seq == 1``,
+        measured +1.5% E2E) is admitted: with MTP enabled, seq_len_q == 1
         requests are the draft-step forwards, whose tiny effective batch makes
-        CuteDSL a net E2E loss (ADP+MTP3 measured about -13%), while the
-        allowlisted win was measured on the MTP-off main decode."""
-        if (num_heads, seq_len_q) in ((16, 2), (16, 4)):
-            return True, ""
+        CuteDSL a net E2E loss."""
+        if num_heads == 16:
+            min_batch = cls._H16_MIN_BATCH_BY_SQ.get(seq_len_q)
+            if min_batch is None:
+                return False, (
+                    f"CuTe DSL MLA decode is not a perf win for num_heads=16, "
+                    f"seq_len_q={seq_len_q}; allowed seq_len_q: "
+                    f"{sorted(cls._H16_MIN_BATCH_BY_SQ)}."
+                )
+            if num_generations >= min_batch:
+                return True, ""
+            return False, (
+                f"CuTe DSL MLA decode (16, {seq_len_q}) is only a perf win at "
+                f"batch >= {min_batch}; got num_generations={num_generations}."
+            )
         if (num_heads, seq_len_q) == (128, 1):
             if predicted_tokens_per_seq == 1:
                 return True, ""
@@ -243,8 +276,7 @@ class CuteDslMlaFmha(PhasedFmha):
             )
         return False, (
             f"CuTe DSL MLA decode is not a perf win for num_heads={num_heads}, "
-            f"seq_len_q={seq_len_q}; allowed (num_heads, seq_len_q): "
-            "[(16, 2), (16, 4), (128, 1)]."
+            f"seq_len_q={seq_len_q}."
         )
 
     def _is_supported_with_reason(
@@ -296,7 +328,10 @@ class CuteDslMlaFmha(PhasedFmha):
         # Perf gate (NOT a correctness limit): only admit shapes where CuteDSL
         # beats the default path E2E; everything else falls back.
         favorable, reason = self._is_perf_favorable(
-            attn.num_heads, seq_len_q, attn.predicted_tokens_per_seq
+            attn.num_heads,
+            seq_len_q,
+            attn.predicted_tokens_per_seq,
+            meta.num_generations,
         )
         if not favorable:
             return False, reason
@@ -509,6 +544,12 @@ class CuteDslMlaFmha(PhasedFmha):
             page_size,
             softmax_scale,
             output_scale,
+            # Seeds the AutoTuner's tune_max_num_tokens: one in-autotune
+            # forward at any batch then profiles the full power-of-2 bucket
+            # ladder up to the engine's max batch, so runtime batches never
+            # fall to default_tactic (whose fresh split_kv would JIT-compile
+            # a new kernel variant inside the timed region).
+            int(meta.max_num_requests),
         )
 
     def run_mla_generation(
