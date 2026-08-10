@@ -15,6 +15,7 @@
 """CuTe DSL MLA decode FMHA library."""
 
 import math
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -37,6 +38,18 @@ if TYPE_CHECKING:
     )
 
 _LOG2_E = math.log2(math.e)
+
+
+def _perf_gate_disabled() -> bool:
+    """Whether the decode perf gate is bypassed via the environment.
+
+    The gate is a perf whitelist, not a correctness limit, so disabling it is
+    the supported way to benchmark shapes that are not (yet) on the whitelist
+    -- e.g. sweeping a new num_heads to find its crossover batch size before
+    adding it to ``_PERF_MIN_BATCH_FP8``. Read on every call rather than
+    cached at import so it can be toggled per process without reimporting.
+    """
+    return os.environ.get("TLLM_CUTE_DSL_DISABLE_PERF_GATE", "0") == "1"
 
 
 class CuteDslMlaFmha(PhasedFmha):
@@ -221,7 +234,12 @@ class CuteDslMlaFmha(PhasedFmha):
         bf16/fp16 KV: only num_heads == 16 is admitted.
 
         ``batch_size=None`` evaluates only the batch-size-independent
-        conditions (dtype, num_heads, seq_len_q) and skips the batch floor."""
+        conditions (dtype, num_heads, seq_len_q) and skips the batch floor.
+
+        ``TLLM_CUTE_DSL_DISABLE_PERF_GATE=1`` admits every shape the kernel can
+        implement (benchmarking escape hatch, see ``_perf_gate_disabled``)."""
+        if _perf_gate_disabled():
+            return True, ""
         if kernel_dtype != torch.float8_e4m3fn:
             if num_heads == 16:
                 return True, ""
